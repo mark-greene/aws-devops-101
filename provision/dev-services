@@ -1,0 +1,242 @@
+#!/usr/bin/env ruby
+
+require 'fog/aws'
+require 'erb'
+
+Fog.credentials_path = File.expand_path('../fogrc', __FILE__)
+Fog.credential = (ENV['FOG_CREDENTIAL'] || :dev).to_sym
+
+ssh_key = ENV['KEYPAIR'] || Fog.credentials[:keypair]
+bastion_ami = ENV['BASTION_AMI'] || 'ami-5189a661'
+#                                   'ami-d05e75b8' # 14.04 HVM EBS+SSD east-1
+#                                   'ami-df6a8b9b'  # 14.04 HVM EBS+SSD west-1
+#                                   'ami-5189a661' # 14.04 HVM EBS+SSD west-2
+#                                   (as of 2015-09-14)
+
+vpc = 'Mark'
+
+subnet_groups = {
+  'mark-dev-netgroup' => ['mark-dev-app',
+                             'mark-dev-app-failover']
+}
+
+databases = {
+  'mark-dev' => {
+    size: 'db.t2.micro',
+    engine: 'postgres',
+    allocated_storage: 5,
+    db_name: 'mark_dev',
+    master_username: 'mark_dev_user',
+    password: Fog.credentials[:db_password],
+    security_groups: ['mark-rds-dev'],
+    subnet: 'mark-dev-netgroup',
+    multi_az: true,
+    backup_retention_period: 0
+  }
+}
+
+volumes = {}
+
+balancers = {
+  'mark-dev-lb' => {
+    subnets: ['mark-dev-app-elb', 'mark-dev-app-elb-failover'],
+    groups: ['mark-aws-elb-dev'],
+    listeners: [
+      {port: 80, protocol: 'HTTP',
+       instance_port: 8080, instance_protocol: 'HTTP'},
+      {port: 443, protocol: 'HTTPS',
+        instance_port: 8080, instance_protocol: 'HTTP', certificate: 'example.com'}
+    ],
+    health_check: {"HealthyThreshold" => 10, "Interval" => 30, "Target" => "HTTP:8080/ping", "Timeout" => 5, "UnhealthyThreshold" => 2}
+  }
+}
+
+instances = {
+  'mark-bastion' => {
+    subnet: 'mark-dmz',
+    image: bastion_ami,
+    groups: ['mark-bastion', 'mark-outbound-inet'],
+    ssh_key: ssh_key,
+    size: 't2.micro',
+    username: 'ubuntu',
+    ip: true,
+    dns: {'mark.example.com.' => 'bastion.mark.example.com.'},
+    skel: true
+  }
+}
+
+###### run forrest run
+
+require 'fog'
+
+compute = Fog::Compute[:aws]
+dns = Fog::DNS[:aws]
+rds = Fog::AWS::RDS.new
+elb = Fog::AWS::ELB.new
+iam = Fog::AWS::IAM.new({region: 'us-east-1'})
+
+v = compute.vpcs.all('tag:Name' => vpc, 'state' => 'available').first
+memory_subnets = {}
+
+subnet_groups.each do |name, vpc_subnets|
+  netspec = []
+  vpc_subnets.each do |net|
+    memory_subnets[net] ||= compute.subnets.all('vpc-id' => v.id,
+                                                'tag:Name' => net).first
+    netspec << memory_subnets[net].subnet_id
+  end
+  group = rds.subnet_groups.detect {|x| x.vpc_id == v.id &&
+                                        x.id == name }
+  unless group
+    group = rds.subnet_groups.create(id: name, description: name,
+                                     vpc_id: v.id, subnet_ids: netspec)
+    group.wait_for { ready? }
+  end
+  memory_subnets[name] = group
+end
+
+database = 'mark-dev'
+
+databases.each do |name, attributes|
+  server = rds.servers.detect {|x| x.id == name && x.state != 'deleting' }
+  next if server
+  groups = attributes[:security_groups].map do |named_group|
+    compute.security_groups.all('tag:Name' => named_group).first.
+         group_id
+  end
+  server = rds.servers.create id: name,
+                              engine: attributes[:engine],
+                              allocated_storage:
+                              attributes[:allocated_storage],
+                              db_name: attributes[:db_name],
+                              master_username: attributes[:master_username],
+                              password: attributes[:password],
+                              vpc_security_groups: groups,
+                              db_subnet_group_name: attributes[:subnet],
+                              flavor_id: attributes[:size],
+                              multi_az: attributes[:multi_az],
+                              backup_retention_period:
+                              attributes[:backup_retention_period]
+
+end
+
+balancer = 'mark-dev-lb'
+
+balancers.each do |name, attributes|
+  balancer = elb.load_balancers.detect {|x| x.vpc_id == v.id && x.id == name }
+  next if balancer
+  netspec = []
+  attributes[:subnets].each do |net|
+    memory_subnets[net] ||= compute.subnets.all('vpc-id' => v.id,
+                                                'tag:Name' => net).first
+    netspec << memory_subnets[net].subnet_id
+  end
+  groups = attributes[:groups].map {|x|
+             compute.security_groups.all('tag:Name' => x).first.group_id }
+  listenspec = []
+  attributes[:listeners].each do |listener|
+    format = {protocol: 'Protocol', port: 'LoadBalancerPort',
+              instance_port: 'InstancePort',
+              instance_protocol: 'InstanceProtocol'}
+    rv = format.inject({}) {|m,(k,v)| m.merge(v => listener[k]) }
+    if cert=listener[:certificate]
+      rv['SSLCertificateId'] = iam.get_server_certificate(cert).
+                                 body['Certificate']['Arn']
+    end
+    fog_listener = Fog::AWS::ELB::Listener.new(rv)
+    listenspec << {'Listener' => fog_listener.to_params,
+                   'PolicyNames' => fog_listener.policy_names}
+  end
+  balancer = elb.load_balancers.create(id: name,
+                                       subnet_ids: netspec,
+                                       security_groups: groups,
+                                       'ListenerDescriptions' => listenspec)
+
+  balancer.configure_health_check(attributes[:health_check]) if attributes.has_key? :health_check
+end
+
+volumes.each do |name, size|
+  vol = compute.volumes.all('tag:Name' => name).first
+  next if vol
+  server_spec = instances[name]
+  net = memory_subnets.fetch(server_spec[:subnet]) {|net_name|
+    compute.subnets.all('vpc-id' => v.id, 'tag:Name' => net_name).first
+  }
+  az = net.availability_zone
+  vol = compute.volumes.create(availability_zone: az, size: size)
+  compute.create_tags vol.id, 'Name' => name
+  vol.wait_for { ready? }
+end
+
+instances.each do |name, attributes|
+  instance = compute.servers.all('tag:Name' => name, 'vpc-id' => v.id).first
+  next if instance
+
+  net = memory_subnets.fetch(attributes[:subnet]) {|net_name|
+    compute.subnets.all('vpc-id' => v.id, 'tag:Name' => net_name).first
+  }
+  groups = attributes[:groups].map {|x|
+             compute.security_groups.all('tag:Name' => x).first.group_id }
+  instance = compute.servers.create security_group_ids: groups,
+                                    key_name: attributes[:ssh_key],
+                                    subnet_id: net.subnet_id,
+                                    image_id: attributes[:image],
+                                    flavor_id: attributes[:size],
+                                    associate_public_ip: attributes[:ip]
+  compute.create_tags instance.id, {'Name' => name, 'User' => attributes[:username]}
+
+  instance.wait_for { ready? }
+
+  if attributes[:dns]
+    zone = attributes[:dns].keys.first
+    record = attributes[:dns].values.first
+    zone = dns.zones.detect{|x| x.domain == zone }
+    entry = zone.records.detect {|x| x.name == record }
+    entry.destroy if entry
+    entry ||= zone.records.new name: record, type: 'A'
+    entry.value = [instance.public_ip_address]
+    entry.save
+  end
+
+  if attributes[:privatedns]
+    zone = attributes[:privatedns].keys.first
+    record = attributes[:privatedns].values.first
+    zone = dns.zones.detect{|x| x.domain == zone }
+    entry = zone.records.detect {|x| x.name == record }
+    entry.destroy if entry
+    entry ||= zone.records.new name: record, type: 'A'
+    entry.value = [instance.private_ip_address]
+    entry.save
+  end
+
+  if attributes[:ebs]
+    vol = compute.volumes.all('tag:Name' => name).first
+    compute.attach_volume instance.id, vol.id, attributes[:ebs]
+  end
+
+  if attributes[:skel]
+    instance_path = File.expand_path("../instances/#{name}", __FILE__)
+    FileUtils.rm_rf(instance_path) if File.directory?(instance_path)
+    FileUtils.mkdir_p instance_path
+
+    skel_path = File.expand_path('../skel', __FILE__)
+    server = instance.attributes.dup
+    Dir["#{skel_path}/*"].each do |filename|
+      next if filename.start_with?('.') or File.directory?(filename)
+      newpath = "#{instance_path}/#{File.basename(filename, '.erb')}"
+      if filename.match(/\.erb$/)
+        begin
+          output = ERB.new(File.read(filename)).result(binding)
+          stat = File.stat(filename)
+          File.open(newpath, 'w', stat.mode) {|f| f.write(output) }
+        rescue
+          puts "Unable to build skeleton template for #{filename}"
+          puts $!.to_s
+        end
+      else
+        FileUtils.cp filename, newpath
+      end
+      FileUtils.chmod '+x', newpath
+    end
+  end
+end

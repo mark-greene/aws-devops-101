@@ -1,0 +1,26 @@
+#!/usr/bin/env ruby
+
+vpc = '<%= vpc %>'
+name = '<%= server[:tags]['Name'] %>'
+lb_name = '<%= balancer %>'
+
+require 'fog'
+require 'fog/aws'
+
+Fog.credentials_path = File.expand_path('../../../fogrc', __FILE__)
+Fog.credential = :dev
+
+compute = Fog::Compute[:aws]
+
+v = compute.vpcs.all('tag:Name' => vpc, 'state' => 'available').first
+server =  compute.servers.all('vpc-id' => v.id, 'tag:Name' => name).detect {|x|
+              x.state == 'running' }
+
+elb = Fog::AWS::ELB.new
+balancer = elb.load_balancers.get(lb_name)
+
+if balancer
+  balancer.register_instances(server.id)
+else
+  puts 'Could not find load balancer'
+end

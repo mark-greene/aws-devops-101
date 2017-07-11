@@ -1,0 +1,8 @@
+#!/bin/bash
+echo $1
+
+config_path=$PWD
+cd ../../../
+scp -F ${config_path}/ssh-config example/*.js $1:
+scp -F ${config_path}/ssh-config provision/deploy.sh $1:
+ssh -F ${config_path}/ssh-config $1 sudo ./deploy.sh $1 $2 $3 $4

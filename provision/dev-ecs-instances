@@ -1,0 +1,112 @@
+#!/usr/bin/env ruby
+
+require 'fog/aws'
+
+Fog.credentials_path = File.expand_path('../fogrc', __FILE__)
+Fog.credential = (ENV['FOG_CREDENTIAL'] || :dev).to_sym
+
+ssh_key = ENV['KEYPAIR'] || Fog.credentials[:keypair]
+
+image = ENV['IMAGE'] || 'ami-02a24162'
+#                       'ami-43043329' # 14.04 ecs-optimized east-1
+#                       'ami-a77b0ac7'  # 14.04 ecs-optimized west-1
+#                       'ami-02a24162' # 14.04 ecs-optimized west-2
+#                       (as of 2015-09-14)
+
+vpc = 'Mark'
+dotenv_stage = Fog.credentials[:dotenv_stage]
+
+instances = {
+  'mark-ecs-dev' => {
+    subnet: ['mark-dev-platform', 'mark-dev-platform-failover'].sample,
+    image: image,
+    groups: ['mark-darknet', 'mark-outbound-inet', 'mark-platform-dev',
+             'mark-elb-dev', 'mark-db-dev'],
+    ssh_key: ssh_key,
+    profile: 'ecsInstanceRole',
+    size: 'm3.medium',
+    runlist: ['mark::dev'],
+    username: 'ec2-user',
+    cap_stage: 'dev'
+  }
+}
+
+database = 'mark-dev'
+balancer = 'mark-dev-lb'
+
+### Make a little magic before the night is through
+
+require 'fileutils'
+require 'erb'
+require 'fog'
+require 'fog/aws'
+
+compute = Fog::Compute[:aws]
+iam = Fog::AWS::IAM.new({region: 'us-east-1'})
+
+v = compute.vpcs.all('tag:Name' => vpc, 'state' => 'available').first
+
+instances.each do |name, attributes|
+  instances = compute.servers.all('vpc-id' => v.id)
+  instances.reject! {|x| ['shutting-down', 'terminated'].include?(x.state) }
+  instances.reject! {|x| x.tags['Name'] !~ /#{name}-\d{3}/ }
+  numbers = instances.map{|x| x.tags['Name'].split('-').last.to_i }.sort
+  last_number = numbers.inject(0) {|m,x| (m + 1 == x) ? x : m }
+  number = '%03i' % (last_number + 1)
+  name_tag = "#{name}-#{number}"
+
+  # iam.remove_role_from_instance_profile(attributes[:profile], attributes[:profile])
+  # iam.delete_instance_profile(attributes[:profile])
+  profile = iam.list_instance_profiles().body['InstanceProfiles'].detect {|x| x['InstanceProfileName'] == attributes[:profile]}
+  # p profile
+  unless profile
+    puts attributes[:profile]
+    iam.create_instance_profile(attributes[:profile])
+    role = iam.list_roles().body['Roles'].detect {|x| x['RoleName'] == attributes[:profile]}
+    # p role
+    unless role
+      iam.create_role(attributes[:profile], Fog::AWS::IAM::EC2_ASSUME_ROLE_POLICY)
+      iam.attach_role_policy(attributes[:profile], 'arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceforEC2Role')
+      iam.attach_role_policy(attributes[:profile], 'arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess')
+    end
+    iam.add_role_to_instance_profile(attributes[:profile], attributes[:profile])
+  end
+
+  net = compute.subnets.all('vpc-id' => v.id,
+                            'tag:Name' => attributes[:subnet]).first
+  groups = attributes[:groups].map {|x|
+    group_conditions = {'vpc-id' => v.id, 'tag:Name' => x}
+    compute.security_groups.all(group_conditions).first.group_id
+  }
+  instance = compute.servers.create security_group_ids: groups,
+                                    key_name: attributes[:ssh_key],
+                                    subnet_id: net.subnet_id,
+                                    image_id: attributes[:image],
+                                    flavor_id: attributes[:size],
+                                    iam_instance_profile_name: attributes[:profile]
+  compute.create_tags instance.id, {'Name' => name_tag, 'User' => attributes[:username]}
+
+  puts name_tag
+  instance.reload
+
+  instance_path = File.expand_path("../instances/#{name_tag}", __FILE__)
+  FileUtils.rm_rf(instance_path) if File.directory?(instance_path)
+  FileUtils.mkdir_p instance_path
+
+  skel_path = File.expand_path('../skel', __FILE__)
+  server = instance.attributes.dup
+  Dir["#{skel_path}/*"].each do |filename|
+    next if filename.start_with?('.') or File.directory?(filename)
+    newpath = "#{instance_path}/#{File.basename(filename, '.erb')}"
+    if filename.match(/\.erb$/)
+      output = ERB.new(File.read(filename)).result(binding)
+      stat = File.stat(filename)
+      File.open(newpath, 'w', stat.mode) {|f| f.write(output) }
+    else
+      FileUtils.cp filename, newpath
+    end
+    FileUtils.chmod '+x', newpath
+  end
+
+  instance.wait_for { ready? }
+end

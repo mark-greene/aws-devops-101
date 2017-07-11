@@ -1,0 +1,27 @@
+#!/usr/bin/env ruby
+
+server_name = '<%= server[:tags]['Name'] %>'
+db_name = '<%= database %>'
+
+require 'fog'
+require 'fog/aws'
+
+Fog.credentials_path = File.expand_path('../../../fogrc', __FILE__)
+Fog.credential = :dev
+
+compute = Fog::Compute[:aws]
+# find the ip of a random ecs instance (service)
+vpc = compute.vpcs.all('tag:Name': '<%= vpc %>', 'state': 'available').first
+instances = compute.servers.all('vpc-id': vpc.id)
+instances.reject! {|x| ['shutting-down', 'terminated'].include?(x.state) }
+instances.reject! {|x| x.tags['Name'] !~ /#{'mark-ecs-dev'}-\d{3}/ }
+service_ip = 'http://localhost'
+service_ip = 'http://' + instances.sample.private_ip_address if instances.any?
+
+# find the db info
+rds = Fog::AWS::RDS.new
+server = rds.servers.detect {|x| x.id == db_name && x.state != 'deleting' }
+endpoint = server.endpoint['Address']
+password = Fog.credentials[:db_password]
+
+exec "./deploy-run", server_name, endpoint, password, service_ip

@@ -1,0 +1,10 @@
+ForwardAgent yes
+GlobalKnownHostsFile /dev/null
+UserKnownHostsFile /dev/null
+StrictHostKeyChecking no
+
+Host <%= server[:tags]['Name'] %>
+  IdentityFile ~/.ssh/<%= server[:key_name] %>.pem
+  ProxyCommand ssh -i ~/.ssh/<%= server[:key_name] %>.pem ubuntu@bastion.mark.example.com -W %h:%p
+  Hostname <%= server[:private_ip_address] %>
+  User <%= server[:tags]['User'] %>

@@ -1,0 +1,141 @@
+#!/bin/bash
+# requires apt-get install jq
+set -e
+
+DOMAIN="example.com"
+ZONE=${2:-"example"}.$DOMAIN
+if [ -z $1 ]; then URL=$ZONE; else URL=$1.$ZONE; fi
+# URL=${1:-"ui"}.$ZONE
+echo SES - Configure $URL
+
+MAIL=${ZONE//[.]/-}-receive-mail
+REFERER=$(aws iam get-user | awk -F'[:/]+' '/arn:aws:/{print $5}')
+
+echo S3 - Configure $MAIL for $REFERER
+aws s3api create-bucket --bucket $MAIL
+
+cat << EOM > bucket-policy.json
+{
+	"Version": "2008-10-17",
+	"Statement": [
+		{
+			"Sid": "GiveSESPermissionToWriteEmail",
+			"Effect": "Allow",
+			"Principal": {
+				"Service": "ses.amazonaws.com"
+			},
+			"Action": "s3:PutObject",
+			"Resource": "arn:aws:s3:::$MAIL/*",
+			"Condition": {
+				"StringEquals": {
+					"aws:Referer": "$REFERER"
+				}
+			}
+		}
+	]
+}
+EOM
+
+aws s3api put-bucket-policy --bucket $MAIL \
+    	--policy file://bucket-policy.json
+rm bucket-policy.json
+
+RULE_SET=${URL//[.]/-}
+NAME=$(aws ses list-receipt-rule-sets | jq -r --arg NAME "$RULE_SET" \
+			'.RuleSets[] | select(.Name == $NAME) | .Name')
+if [ -z "$NAME" ]
+then
+	echo SES - Create Rule Set $RULE_SET
+	aws ses create-receipt-rule-set --rule-set-name $RULE_SET
+
+	PREFIX=${URL%%.$DOMAIN}
+	PREFIX=${PREFIX//[.]/-}
+	echo SES - Create Rule $PREFIX
+
+cat << EOM > rule.json
+{
+		"RuleSetName": "$RULE_SET",
+		"Rule": {
+				"Name": "default-rule",
+				"Enabled": true,
+				"TlsPolicy": "Optional",
+				"Recipients": [
+						"$URL",
+						".$URL"
+				],
+				"Actions": [
+						{
+								"S3Action": {
+										"BucketName": "$MAIL",
+										"ObjectKeyPrefix": "$PREFIX"
+								}
+						}
+				],
+				"ScanEnabled": true
+		}
+}
+EOM
+
+	aws ses create-receipt-rule --rule-set-name $RULE_SET --cli-input-json file://rule.json
+	rm rule.json
+fi
+
+aws ses verify-email-identity --email-address admin@$ZONE
+TOKEN=$(aws ses verify-domain-identity --domain $URL | jq -r '.VerificationToken')
+# add txt and mx record
+# inbound-smtp.us-east-1.amazonaws.com
+# inbound-smtp.us-west-2.amazonaws.com
+
+echo Route53 - Configure  $URL
+contains () { for e in "${@:2}"; do [[ "$e" = "$1" ]] && return 0; done; return 1; }
+
+ID=$(aws route53 list-hosted-zones | jq -r --arg ZONE "$ZONE." \
+  		'.HostedZones[] | select(.Name == $ZONE) | .Id')
+if [ -n "$ID" ]
+then
+	ID=$(basename $ID)
+
+	TYPES=($(echo $(aws route53 list-resource-record-sets --hosted-zone-id "$ID" | jq -r --arg URL "$URL." \
+	    	'.ResourceRecordSets[] | select(.Name == $URL) | .Type')))
+  if ! contains "TXT" "${TYPES[@]}"
+	then
+		echo Route53 - Add Record Set $URL to $ZONE in $ID
+
+cat << EOM > record-set.json
+{
+  "Changes": [
+    {
+      "Action": "CREATE",
+      "ResourceRecordSet": {
+        "Name": "$URL",
+        "Type": "TXT",
+				"TTL": 300,
+				"ResourceRecords": [
+						{
+								"Value": "\"$TOKEN\""
+						}
+				]
+      }
+    },
+		{
+      "Action": "CREATE",
+      "ResourceRecordSet": {
+        "Name": "$URL",
+        "Type": "MX",
+				"TTL": 300,
+				"ResourceRecords": [
+						{
+								"Value": "10 inbound-smtp.us-east-1.amazonaws.com"
+						}
+				]
+      }
+    }
+  ]
+}
+EOM
+
+		aws route53 change-resource-record-sets --hosted-zone-id "$ID" \
+		    --change-batch file://record-set.json
+		rm record-set.json
+	fi
+fi

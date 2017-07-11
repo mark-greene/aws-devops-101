@@ -1,0 +1,54 @@
+#!/bin/bash
+# requires apt-get install jq
+set -e
+
+# pass name in '$1' or default to example-service
+SERVICE=${1:-example-service}
+
+echo Building $SERVICE
+# docker login aws ecr
+aws ecr get-login --region us-east-1 > login
+while read i; do $i; done < login
+rm login
+
+ID=$(aws ecr describe-repositories | jq -r --arg SERVICE "$SERVICE" '.repositories[] | select(.repositoryName == $SERVICE) | .registryId')
+if [ -z "$ID" ]
+then
+  echo Creating ECR Repository $SERVICE
+  # create an ecr repository
+  ID=$(aws ecr create-repository --repository-name $SERVICE --region us-east-1 | jq -r .repository.registryId)
+
+cat << EOM > ecr-policy.json
+{
+    "Version": "2008-10-17",
+    "Statement": [
+        {
+            "Sid": "Container Access",
+            "Effect": "Allow",
+            "Principal": {
+                "AWS": "arn:aws:iam::$ID:role/ecsInstanceRole"
+            },
+            "Action": [
+                "ecr:GetDownloadUrlForLayer",
+                "ecr:BatchGetImage",
+                "ecr:BatchCheckLayerAvailability"
+            ]
+        }
+    ]
+}
+EOM
+
+  aws ecr set-repository-policy --repository-name $SERVICE --policy-text file://ecr-policy.json
+  rm ecr-policy.json
+fi
+
+echo Building docker image
+# build docker image
+docker build -t $SERVICE .
+
+# tag for ecr
+docker tag $SERVICE:latest $ID.dkr.ecr.us-east-1.amazonaws.com/$SERVICE:latest
+
+echo Pushing to ECR
+# push to ecr
+docker push $ID.dkr.ecr.us-east-1.amazonaws.com/$SERVICE:latest

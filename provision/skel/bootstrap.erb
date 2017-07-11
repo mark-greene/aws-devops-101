@@ -1,0 +1,6 @@
+#!/bin/bash
+
+config_path=$PWD
+cd ../../../
+scp -F ${config_path}/ssh-config provision/bootstrap.sh <%= server[:tags]['Name'] %>:
+ssh -F ${config_path}/ssh-config <%= server[:tags]['Name'] %> sudo ./bootstrap.sh

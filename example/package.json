@@ -1,0 +1,19 @@
+{
+  "name": "hello-node",
+  "description": "Simple app with rest apis",
+  "author": "Mark Greene <mark.greene@lexmark.com>",
+  "main": "lib/foo.js",
+  "repository": {
+    "type": "git",
+    "url": "http://github.rds.lexmark.com/greenem/aws-provisioning"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "restify": "4.0.x",
+    "pg": "4.5.x"
+  },
+  "devDependencies": {
+
+  },
+  "engine": "node >= 5.1.1"
+}

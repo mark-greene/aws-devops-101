@@ -1,0 +1,6 @@
+#!/bin/bash
+
+config_path=$PWD
+cd ../../../
+scp -F ${config_path}/ssh-config provision/install_ssh_keys.sh <%= server[:tags]['Name'] %>:
+ssh -F ${config_path}/ssh-config <%= server[:tags]['Name'] %> ./install_ssh_keys.sh

@@ -1,0 +1,206 @@
+#!/usr/bin/env ruby
+
+require 'fog/aws'
+
+Fog.credentials_path = File.expand_path('../fogrc', __FILE__)
+Fog.credential = (ENV['FOG_CREDENTIAL'] || :dev).to_sym
+
+ssh_key = ENV['KEYPAIR'] || Fog.credentials[:keypair]
+nat_ami = ENV['NAT_AMI'] || 'ami-2dae821d'
+#                           'ami-c02b04a8' # vpc-nat-pv-2015.03.0 east-1
+#                           'ami-67a54423' # vpc-nat-pv-2015.03.0 west-1
+#                           'ami-2dae821d' # vpc-nat-pv-2015.03.0 west-2
+#                           (as of 2015-09-14)
+
+vpc = {'Mark' => '10.20.0.0/16'}
+subnets = {'mark-dmz' => '10.20.0.0/24',
+           'mark-dev-app' => '10.20.165.0/24',
+           'mark-dev-app-elb' => '10.20.167.0/24',
+           'mark-dev-platform' => '10.20.170.0/24'}
+redundant_subnets = {'mark-dev-app' => '10.20.166.0/24',
+                     'mark-dev-app-elb' => '10.20.168.0/24',
+                     'mark-dev-platform' => '10.20.171.0/24'}
+routers = {'mark-dmz' => ['mark-dmz', 'mark-dev-app-elb',
+                             'mark-dev-app-elb-failover'],
+           'mark-dev' => ['mark-dev-app',
+                             'mark-dev-app-failover',
+                             'mark-dev-platform',
+                             'mark-dev-platform-failover']}
+internet = {'mark-inet' => ['mark-dmz']}
+security_groups = {
+  'mark-outbound-inet' => {cidr: {'0.0.0.0/0' => [(49152..65535)]}},
+  'mark-aws-elb-dev' => {cidr: {'0.0.0.0/0' => [(80..80), (443..443)]}},
+  'mark-bastion' => {cidr: {'0.0.0.0/0' => [(22..22)]},
+                             udp_cidr: {'0.0.0.0/0' => [(123..123)]}},
+  'mark-darknet' => {groups: {'mark-bastion' => [(22..22)]},
+                              udp_groups: {'mark-bastion' => [(123..123)]}},
+  'mark-elb-dev' => {groups: {'mark-aws-elb-dev' => [(8080..8080)]}},
+  'mark-app-dev' => {cidr: {'10.20.170.0/24' => [(1..65535)],
+                               '10.20.171.0/24' => [(1..65535)]}},
+  'mark-platform-dev' => {cidr: {'10.20.165.0/24' => [(1..65535)],
+                                    '10.20.166.0/24' => [(1..65535)],
+                                    '10.20.170.0/24' => [(1..65535)],
+                                    '10.20.171.0/24' => [(1..65535)]}},
+  'mark-db-dev' => {},
+  'mark-rds-dev' => {groups: {'mark-db-dev' => [(5432..5432)]}},
+  'mark-nat-dev' => {cidr: {
+    '10.20.0.0/24' => [(80..80), (443..443), (22..22), (9418..9418)],
+    '10.20.165.0/24' => [(80..80), (443..443), (22..22), (9418..9418)],
+    '10.20.166.0/24' => [(80..80), (443..443), (22..22), (9418..9418)],
+    '10.20.170.0/24' => [(80..80), (443..443), (22..22), (9418..9418)],
+    '10.20.171.0/24' => [(80..80), (443..443), (22..22), (9418..9418)]}}
+}
+natter = {
+  'mark-nat-dev' => {subnet: 'mark-dmz',
+                        image: nat_ami,
+                        groups: ['mark-nat-dev'],
+                        ssh_key: ssh_key,
+                        size: 'm3.medium'},
+}
+nat = {
+  'mark-nat-dev' => ['mark-dev-app',
+                        'mark-dev-app-failover',
+                        'mark-dev-platform',
+                        'mark-dev-platform-failover']
+}
+
+###### Make it so.
+
+require 'fog'
+require 'fog/aws'
+
+compute = Fog::Compute[:aws]
+
+vpc_name = vpc.keys.first
+vpc_cidr = vpc.values.first
+v = compute.vpcs.all('tag:Name' => vpc_name, 'state' => 'available').first
+unless v
+  v = compute.vpcs.create(cidr_block: vpc_cidr)
+  compute.create_tags v.id, 'Name' => vpc_name
+  v.wait_for { ready? }
+end
+
+# dmz_zone = 'us-east-1c'
+# primary_zone = 'us-east-1d'
+# failover_zone = 'us-east-1b'
+
+## If the above hasn't been determined yet, roulette
+zones = compute.describe_availability_zones.body['availabilityZoneInfo'].
+          map {|x| x['zoneName'] }
+dmz_zone = zones.sample
+primary_zone = (zones - [dmz_zone]).sample
+failover_zone = (zones - [dmz_zone, primary_zone]).sample
+
+memory_subnets = {}
+subnets.each do |name, cidr|
+  net = compute.subnets.all('tag:Name' => name, 'state' => 'available',
+                            'vpc-id' => v.id).first
+  unless net
+    zone =  name.match(/dmz/) ? dmz_zone : primary_zone
+    net = compute.subnets.create(cidr_block: cidr, vpc_id: v.id,
+                                 availability_zone: zone)
+    compute.create_tags net.subnet_id, 'Name' => name
+    net.wait_for { ready? }
+  end
+  memory_subnets[name] = net
+end
+
+redundant_subnets.each do |name, cidr|
+  original = memory_subnets[name]
+  name = "#{name}-failover"
+  net = compute.subnets.all('tag:Name' => name, 'state' => 'available',
+                            'vpc-id' => v.id).first
+  unless net
+    net = compute.subnets.create(cidr_block: cidr, vpc_id: v.id,
+                                 availability_zone: failover_zone)
+    compute.create_tags net.subnet_id, 'Name' => name
+    net.wait_for { ready? }
+  end
+  memory_subnets[name] = net
+end
+
+memory_routers = {}
+routers.each do |name, subnets|
+  table = compute.route_tables.all('tag:Name' => name, 'vpc-id' => v.id).first
+  unless table
+    table = compute.route_tables.create(vpc_id: v.id)
+    compute.create_tags table.id, 'Name' => name
+  end
+  subnets.each do |name|
+    compute.associate_route_table table.id, memory_subnets[name].subnet_id
+    memory_subnets[name].reload
+    memory_routers[name] = table
+  end
+end
+
+internet.each do |name, subnets|
+  inet = compute.internet_gateways.all('tag:Name' => name).first
+  unless inet
+    inet = compute.internet_gateways.create
+    compute.create_tags inet.id, 'Name' => name
+    inet.attach v.id
+  end
+
+  subnets.each do |net|
+    router = memory_routers[net]
+    compute.create_route router.id, '0.0.0.0/0', inet.id
+  end
+end
+
+memory_groups = {}
+security_groups.each do |name, permissions|
+  group = compute.security_groups.
+            all('tag:Name' => name, 'vpc-id' => v.id).first
+  unless group
+    group = compute.security_groups.create(name: name, description: name,
+                                           vpc_id: v.id)
+    compute.create_tags group.group_id, 'Name' => name
+    (permissions[:cidr] || {}).each do |cidr, ports|
+      ports.each do |range|
+        group.authorize_port_range range, cidr_ip: cidr
+      end
+    end
+    (permissions[:udp_cidr] || {}).each do |cidr, ports|
+      ports.each do |range|
+        group.authorize_port_range range, {cidr_ip: cidr, :ip_protocol => 'udp'}
+      end
+    end
+    (permissions[:groups] || {}).each do |other_group, ports|
+      other_group = {group.owner_id => memory_groups[other_group].group_id}
+      ports.each do |range|
+        group.authorize_port_range range, group: other_group
+      end
+    end
+    (permissions[:udp_groups] || {}).each do |other_group, ports|
+      other_group = {group.owner_id => memory_groups[other_group].group_id}
+      ports.each do |range|
+        group.authorize_port_range range, {group: other_group, :ip_protocol => 'udp'}
+      end
+    end
+  end
+  memory_groups[name] = group
+end
+
+natter.each do |name, attributes|
+  instance = compute.servers.all('tag:Name' => name, 'vpc-id' => v.id).first
+  unless instance
+    net = memory_subnets[attributes[:subnet]]
+    groups = attributes[:groups].map {|x| memory_groups[x].group_id }
+    instance = compute.servers.create security_group_ids: groups,
+                                      key_name: attributes[:ssh_key],
+                                      subnet_id: net.subnet_id,
+                                      image_id: attributes[:image],
+                                      flavor_id: attributes[:size],
+                                      associate_public_ip: true
+    compute.create_tags instance.id, 'Name' => name
+    instance.wait_for { ready? }
+    attrs = {'SourceDestCheck.Value' => false}
+    compute.modify_instance_attribute instance.id, attrs
+  end
+  nat[name].each do |net|
+    router = memory_routers[net]
+    unless router.routes.detect {|x| x['destinationCidrBlock'] == '0.0.0.0/0' }
+      compute.create_route router.id, '0.0.0.0/0', inet=nil, instance.id
+    end
+  end
+end

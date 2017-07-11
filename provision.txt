@@ -1,0 +1,54 @@
+cd provision/
+
+cp fogrc.sample fogrc
+# put your credentials into fogrc
+# (you probably want to try it out on your personal account)
+# Make sure to change the base node from Default to your environment name e.g. Production
+# generate a random database password greater than 8 characters
+#    $> date +%s | sha256sum | base64 | head -c 32 ; echo
+
+# Edit scripts to replace `example.com` with your domain
+#   includes skel/ssh-config.erb
+
+# provision cloud
+./dev-cloud
+# look for vpc, subnets, security groups, gateway, nat instance
+
+# provision services
+./dev-services
+# look for bastion host, rds database, load balancer
+
+cd instances/example-bastion
+# only install keys on bastion
+./install-ssh-keys
+# check to see if everything is ok
+./ssh
+
+# provision instance
+./dev-instances
+# look for an instance
+
+cd instances/example-dev-001
+# bootstrap server
+./bootstrap
+# deploy example
+./deploy
+# test
+./ssh
+curl localhost:8080/ping
+
+# add instance to elb
+./load-balance
+
+# repeat instance provisioning as needed
+
+# provision ecs instance
+./dev-ecs-instances
+# look for an ecs instance
+
+cd instances/example-ecs-dev-001
+# check to see if everything is ok
+./ssh
+docker images
+
+# repeat ecs provisioning as needed

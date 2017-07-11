@@ -1,0 +1,84 @@
+#!/bin/bash
+# requires apt-get install jq
+set -e
+
+DOMAIN="example.com"
+ZONE=${2:-"example"}.$DOMAIN
+NAME=${1:-"ui"}.$ZONE
+echo Creating S3 website $NAME
+
+aws s3api create-bucket --bucket "$NAME"
+aws s3 website "s3://$NAME/" --index-document index.html --error-document error.html
+
+echo Setting bucket policy
+cat << EOM > bucket-policy.json
+{
+	"Version": "2012-10-17",
+	"Statement": [
+		{
+			"Sid": "PublicReadGetObject",
+			"Effect": "Allow",
+			"Principal": "*",
+			"Action": "s3:GetObject",
+			"Resource": "arn:aws:s3:::$NAME/*"
+		}
+	]
+}
+EOM
+
+aws s3api put-bucket-policy --bucket "$NAME" --policy file://bucket-policy.json
+rm bucket-policy.json
+
+echo Setting CORS configuration
+cat << EOM > cors-config.json
+{
+  "CORSRules": [
+    {
+      "AllowedOrigins": ["*"],
+      "AllowedHeaders": ["Authorization"],
+      "AllowedMethods": ["GET"],
+      "MaxAgeSeconds": 3000
+    }
+  ]
+}
+EOM
+
+aws s3api put-bucket-cors --bucket "$NAME" --cors-configuration file://cors-config.json
+rm cors-config.json
+
+ID=$(aws route53 list-hosted-zones | jq -r --arg ZONE "$ZONE." '.HostedZones[] | select(.Name == $ZONE) | .Id')
+if [ -n "$ID" ]
+then
+	ID=$(basename $ID)
+  echo Adding Record Set $NAME to $ZONE in $ID
+
+	RECORD_SET=$(aws route53 list-resource-record-sets --hosted-zone-id "$ID" | jq -r --arg NAME "$NAME." '.ResourceRecordSets[] | select(.Name == $NAME) | .Name')
+  if [ -z  "$RECORD_SET" ]
+	then
+# Find HostedZoneID @ http://docs.aws.amazon.com/general/latest/gr/rande.html#s3_region
+cat << EOM > record-set.json
+{
+  "Changes": [
+    {
+      "Action": "CREATE",
+      "ResourceRecordSet": {
+        "Name": "$NAME",
+        "Type": "A",
+        "AliasTarget": {
+          "HostedZoneId": "Z3AQBSTGFYJSTF",
+          "DNSName": "s3-website-us-east-1.amazonaws.com",
+          "EvaluateTargetHealth": false
+        }
+      }
+    }
+  ]
+}
+EOM
+
+    aws route53 change-resource-record-sets --hosted-zone-id "$ID" --change-batch file://record-set.json
+    rm record-set.json
+	fi
+fi
+
+echo Syncing content
+aws s3 sync ../ "s3://$NAME/" --exclude "provision/*" --grants read=uri=http://acs.amazonaws.com/groups/global/AllUsers

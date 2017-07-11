@@ -1,0 +1,9 @@
+service:
+  image: example-service
+  volumes:
+    - ./example:/home/ubuntu/example/
+  ports:
+   - "8080:8080"
+  environment:
+    - SERVICE_URL=http://localhost
+    - SERVICE_PORT=8080

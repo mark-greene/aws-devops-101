@@ -1,0 +1,3 @@
+#!/bin/bash
+
+ssh -F `dirname $0`/ssh-config <%= server[:tags]['Name'] %>

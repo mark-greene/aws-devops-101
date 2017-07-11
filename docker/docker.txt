@@ -1,0 +1,11 @@
+# build and push image to ECR
+./docker-build
+
+# to locally test example-service
+docker-compose up
+curl localhost:8080/ping
+docker-compose down
+
+# see provision.txt to provision ECS instances
+
+# Todo: provisioning ECS clusters, services and tasks
